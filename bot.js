@@ -9,51 +9,22 @@ const TelegramBot = require('node-telegram-bot-api');
 const Anthropic = require('@anthropic-ai/sdk');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const bot = new TelegramBot(TOKEN, { polling: true });
-const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MINI_APP_URL = process.env.MINI_APP_URL || 'https://kingtoki.github.io/tudurka/';
-const TG_API = `https://api.telegram.org/bot${TOKEN}`;
 
-// ============================================================
-// Telegram API helper
-// ============================================================
-async function tgCall(method, params = {}) {
-  const res = await fetch(`${TG_API}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params)
-  });
-  return res.json();
-}
-
-// ============================================================
-// Транскрибировать голосовое через Telegram Bot API
-// Работает для Premium пользователей
-// ============================================================
-async function transcribeVoice(fileId) {
-  const result = await tgCall('transcribeAudio', { file_id: fileId });
-  if (!result.ok) return null;
-
-  let text = result.result?.text;
-  let isFinal = result.result?.is_final;
-  const transcriptionId = result.result?.transcription_id;
-
-  if (!transcriptionId) return text || null;
-
-  // Поллим пока не готово — каждые 2 секунды, максимум 16 секунд
-  let attempts = 0;
-  while (!isFinal && attempts < 8) {
-    await new Promise(r => setTimeout(r, 2000));
-    const poll = await tgCall('getTranscription', { transcription_id: transcriptionId });
-    if (poll.ok) {
-      text = poll.result?.text;
-      isFinal = poll.result?.is_final;
+// ВАЖНО: allowedUpdates включает edited_message — именно туда
+// Telegram Premium присылает транскрипцию голосового
+const bot = new TelegramBot(TOKEN, {
+  polling: {
+    params: {
+      allowed_updates: ['message', 'edited_message', 'callback_query']
     }
-    attempts++;
   }
+});
 
-  return text || null;
-}
+const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// Голосовые которые ждут транскрипцию { chatId_msgId: { chatId, waitMsgId } }
+const pending = new Map();
 
 // ============================================================
 // /start
@@ -81,33 +52,55 @@ bot.onText(/\/list/, (msg) => {
 // ============================================================
 bot.on('voice', async (msg) => {
   const chatId = msg.chat.id;
+  const key = `${chatId}_${msg.message_id}`;
 
-  const waitMsg = await bot.sendMessage(chatId, '🎙️ Транскрибирую голосовое...', {
+  // Иногда транскрипция уже есть прямо в сообщении
+  const immediateText = msg.voice?.transcription?.text;
+  if (immediateText) {
+    await processText(chatId, immediateText, msg.message_id, false);
+    return;
+  }
+
+  // Показываем что ждём и сохраняем в pending
+  const waitMsg = await bot.sendMessage(chatId, '🎙️ Жду транскрипцию...', {
     reply_to_message_id: msg.message_id
   });
 
-  try {
-    const text = await transcribeVoice(msg.voice.file_id);
+  pending.set(key, { chatId, waitMsgId: waitMsg.message_id });
 
-    if (!text) {
+  // Таймаут 20 секунд — если транскрипция не пришла, предлагаем текст
+  setTimeout(() => {
+    if (pending.has(key)) {
+      pending.delete(key);
       bot.editMessageText(
-        '⚠️ Не удалось транскрибировать.\n\nТранскрипция доступна только Premium пользователям.\nНапиши задачу *текстом* — я обработаю! ✍️',
+        '⚠️ Транскрипция не пришла от Telegram.\n\nНапиши задачу *текстом* — я обработаю! ✍️',
         { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown' }
       );
-      return;
     }
+  }, 20000);
+});
 
+// ============================================================
+// edited_message — сюда Telegram Premium присылает транскрипцию
+// После отправки голосового Telegram редактирует сообщение
+// добавляя поле transcription с готовым текстом
+// ============================================================
+bot.on('edited_message', async (msg) => {
+  if (!msg.voice) return;
+
+  const text = msg.voice?.transcription?.text || msg.voice?.transcription;
+  if (!text || typeof text !== 'string') return;
+
+  const key = `${msg.chat.id}_${msg.message_id}`;
+  const p = pending.get(key);
+
+  if (p) {
+    pending.delete(key);
+    // Обновляем сообщение-заглушку
     await bot.editMessageText(`🎙️ _"${text}"_\n\n🤖 Разбираю на задачи...`, {
-      chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown'
+      chat_id: p.chatId, message_id: p.waitMsgId, parse_mode: 'Markdown'
     });
-
-    await processText(chatId, text, waitMsg.message_id, true);
-
-  } catch (err) {
-    console.error('Voice error:', err.message);
-    bot.editMessageText('Ошибка обработки голосового. Попробуй ещё раз.', {
-      chat_id: chatId, message_id: waitMsg.message_id
-    });
+    await processText(p.chatId, text, p.waitMsgId, true);
   }
 });
 
@@ -122,16 +115,16 @@ bot.on('message', async (msg) => {
 // ============================================================
 // Claude AI: текст → задачи
 // ============================================================
-async function processText(chatId, text, replyToId, isEdit = false) {
-  let processingMsgId;
+async function processText(chatId, text, msgId, isEdit) {
+  let processingId;
 
   if (isEdit) {
-    processingMsgId = replyToId;
+    processingId = msgId;
   } else {
     const m = await bot.sendMessage(chatId, '🤖 ИИ разбирает на задачи...', {
-      reply_to_message_id: replyToId
+      reply_to_message_id: msgId
     });
-    processingMsgId = m.message_id;
+    processingId = m.message_id;
   }
 
   try {
@@ -156,7 +149,7 @@ async function processText(chatId, text, replyToId, isEdit = false) {
     const tasks = (parsed.tasks || []).filter(t => t.text?.trim());
     if (!tasks.length) {
       bot.editMessageText('Не смог извлечь задачи. Попробуй сформулировать иначе.', {
-        chat_id: chatId, message_id: processingMsgId
+        chat_id: chatId, message_id: processingId
       });
       return;
     }
@@ -170,7 +163,7 @@ async function processText(chatId, text, replyToId, isEdit = false) {
       `✅ *${n} ${word} добавлено:*\n\n${lines}`,
       {
         chat_id: chatId,
-        message_id: processingMsgId,
+        message_id: processingId,
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [[{
@@ -182,9 +175,9 @@ async function processText(chatId, text, replyToId, isEdit = false) {
     );
 
   } catch(err) {
-    console.error('Claude error:', err.message);
+    console.error('Ошибка:', err.message);
     bot.editMessageText('Ошибка обработки. Попробуй ещё раз.', {
-      chat_id: chatId, message_id: processingMsgId
+      chat_id: chatId, message_id: processingId
     });
   }
 }
